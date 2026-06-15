@@ -1,25 +1,11 @@
 /**
- * CMVNG SIGNALVAULT — PAYMENT API v2 (multi-product)
+ * CMVNG SIGNALVAULT — PAYMENT API v2.1
  *
- * Tracks two parallel product subscriptions per user:
- *   - signals (forex/crypto)
- *   - sports  (betting codes)
+ * Multi-product: signals + sports.
  *
- * SIGNALS endpoints (existing, unchanged):
- *   GET  /can-send?user_id=X
- *   POST /signal-sent
- *   POST /activate                  → product defaults to "signals" if omitted
- *   GET  /status?user_id=X
- *   GET  /subscribe?user_id=X&tier=N
- *   GET  /plans
- *
- * SPORTS endpoints (NEW):
- *   GET  /sports/can-send?user_id=X
- *   POST /sports/code-sent
- *   POST /sports/activate
- *   GET  /sports/status?user_id=X
- *   GET  /sports/subscribe?user_id=X&tier=N
- *   GET  /sports/plans
+ * NEW in v2.1:
+ *   - 3 Odds tier (20 USDC) added
+ *   - Sports free tier: 1 code per DAY (was 1/week)
  */
 
 const express = require("express");
@@ -39,7 +25,6 @@ app.use(express.json());
 
 const db = new Database(path.join(__dirname, "subscriptions.db"));
 
-// SIGNALS: existing users table (unchanged)
 db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     telegram_id TEXT PRIMARY KEY,
@@ -55,7 +40,6 @@ db.exec(`
   )
 `);
 
-// SPORTS: new parallel table
 db.exec(`
   CREATE TABLE IF NOT EXISTS sports_subscriptions (
     telegram_id TEXT PRIMARY KEY,
@@ -63,15 +47,18 @@ db.exec(`
     tier_name TEXT DEFAULT 'Free',
     wallet_address TEXT,
     expires_at TEXT,
-    codes_this_week INTEGER DEFAULT 0,
-    week_start_date TEXT,
+    codes_today INTEGER DEFAULT 0,
+    last_code_date TEXT,
     total_paid_usdc REAL DEFAULT 0,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
   )
 `);
 
-// Unified payments log (both products)
+// Migrate: if old weekly columns exist, ignore them. New schema uses daily.
+try { db.exec(`ALTER TABLE sports_subscriptions ADD COLUMN codes_today INTEGER DEFAULT 0`); } catch(e) {}
+try { db.exec(`ALTER TABLE sports_subscriptions ADD COLUMN last_code_date TEXT`); } catch(e) {}
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS payments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,13 +71,7 @@ db.exec(`
     created_at TEXT DEFAULT (datetime('now'))
   )
 `);
-
-// Migration: add product column if missing (for existing deployments)
-try {
-  db.exec(`ALTER TABLE payments ADD COLUMN product TEXT DEFAULT 'signals'`);
-} catch (e) {
-  // column already exists
-}
+try { db.exec(`ALTER TABLE payments ADD COLUMN product TEXT DEFAULT 'signals'`); } catch(e) {}
 
 // ─── Tier Configs ────────────────────────────────────────────
 
@@ -102,12 +83,13 @@ const SIGNAL_TIERS = {
 };
 
 const SPORTS_TIERS = {
-  0: { name: "Free",        price: 0,   weekly_limit: 1    },
-  1: { name: "2 Odds",      price: 15,  weekly_limit: null },
-  2: { name: "5 Odds",      price: 30,  weekly_limit: null },
-  3: { name: "10 Odds",     price: 60,  weekly_limit: null },
-  4: { name: "100 Odds",    price: 100, weekly_limit: null },
-  5: { name: "Grand Audit", price: 150, weekly_limit: null },
+  0: { name: "Free",        price: 0,   daily_limit: 1    },   // 1 code per day (rotating)
+  1: { name: "2 Odds",      price: 15,  daily_limit: null },
+  2: { name: "3 Odds",      price: 20,  daily_limit: null },
+  3: { name: "5 Odds",      price: 30,  daily_limit: null },
+  4: { name: "10 Odds",     price: 60,  daily_limit: null },
+  5: { name: "100 Odds",    price: 100, daily_limit: null },
+  6: { name: "Grand Audit", price: 150, daily_limit: null },
 };
 
 const CHECKOUT_URL = process.env.CHECKOUT_URL || "https://cmvng-checkout-3.vercel.app";
@@ -116,49 +98,26 @@ const CHECKOUT_URL = process.env.CHECKOUT_URL || "https://cmvng-checkout-3.verce
 
 function today() { return new Date().toISOString().split("T")[0]; }
 
-function weekStart() {
-  // Monday of current week, ISO date
-  const d = new Date();
-  const day = d.getDay() || 7;
-  if (day !== 1) d.setHours(-24 * (day - 1));
-  return d.toISOString().split("T")[0];
-}
-
 function isExpired(row) {
   if (!row || !row.expires_at) return true;
   return new Date(row.expires_at) < new Date();
 }
 
-// ── Signals helpers ──
-function getSignalUser(telegramId) {
-  return db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(telegramId);
+function getSignalUser(id) { return db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(id); }
+function getOrCreateSignalUser(id) {
+  let u = getSignalUser(id);
+  if (!u) { db.prepare("INSERT INTO users (telegram_id) VALUES (?)").run(id); u = getSignalUser(id); }
+  return u;
 }
-
-function getOrCreateSignalUser(telegramId) {
-  let user = getSignalUser(telegramId);
-  if (!user) {
-    db.prepare("INSERT INTO users (telegram_id) VALUES (?)").run(telegramId);
-    user = getSignalUser(telegramId);
-  }
-  return user;
-}
-
-// ── Sports helpers ──
-function getSportsUser(telegramId) {
-  return db.prepare("SELECT * FROM sports_subscriptions WHERE telegram_id = ?").get(telegramId);
-}
-
-function getOrCreateSportsUser(telegramId) {
-  let user = getSportsUser(telegramId);
-  if (!user) {
-    db.prepare("INSERT INTO sports_subscriptions (telegram_id) VALUES (?)").run(telegramId);
-    user = getSportsUser(telegramId);
-  }
-  return user;
+function getSportsUser(id) { return db.prepare("SELECT * FROM sports_subscriptions WHERE telegram_id = ?").get(id); }
+function getOrCreateSportsUser(id) {
+  let u = getSportsUser(id);
+  if (!u) { db.prepare("INSERT INTO sports_subscriptions (telegram_id) VALUES (?)").run(id); u = getSportsUser(id); }
+  return u;
 }
 
 // ═════════════════════════════════════════════════════════════
-// SIGNALS ENDPOINTS (existing — unchanged behavior)
+// SIGNALS ENDPOINTS
 // ═════════════════════════════════════════════════════════════
 
 app.get("/can-send", (req, res) => {
@@ -170,11 +129,7 @@ app.get("/can-send", (req, res) => {
   const config = SIGNAL_TIERS[tier];
 
   if (tier >= 1) {
-    return res.json({
-      allowed: true,
-      tier: tier,
-      tier_name: config.name,
-    });
+    return res.json({ allowed: true, tier, tier_name: config.name });
   }
 
   const todayDate = today();
@@ -187,59 +142,38 @@ app.get("/can-send", (req, res) => {
 
   if (signalsToday >= config.daily_limit) {
     return res.json({
-      allowed: false,
-      tier: 0,
-      tier_name: "Free",
-      reason: "daily_limit_reached",
-      remaining: 0,
+      allowed: false, tier: 0, tier_name: "Free",
+      reason: "daily_limit_reached", remaining: 0,
       upgrade_url: `${CHECKOUT_URL}?tgid=${userId}&product=signals`,
     });
   }
-
-  return res.json({
-    allowed: true,
-    tier: 0,
-    tier_name: "Free",
-    remaining: config.daily_limit - signalsToday,
-  });
+  return res.json({ allowed: true, tier: 0, tier_name: "Free", remaining: config.daily_limit - signalsToday });
 });
 
 app.post("/signal-sent", (req, res) => {
   const userId = req.body.user_id;
   if (!userId) return res.json({ ok: false, reason: "missing_user_id" });
-
   const todayDate = today();
   const user = getOrCreateSignalUser(userId);
-
-  let signalsToday = user.signals_today || 0;
-  if (user.last_signal_date !== todayDate) signalsToday = 0;
-
-  db.prepare(
-    "UPDATE users SET signals_today = ?, last_signal_date = ?, updated_at = datetime('now') WHERE telegram_id = ?"
-  ).run(signalsToday + 1, todayDate, userId);
-
-  return res.json({ ok: true, signals_today: signalsToday + 1 });
+  let s = user.signals_today || 0;
+  if (user.last_signal_date !== todayDate) s = 0;
+  db.prepare("UPDATE users SET signals_today = ?, last_signal_date = ?, updated_at = datetime('now') WHERE telegram_id = ?")
+    .run(s + 1, todayDate, userId);
+  return res.json({ ok: true, signals_today: s + 1 });
 });
 
 app.get("/status", (req, res) => {
   const userId = req.query.user_id;
   if (!userId) return res.json({ ok: false, reason: "missing_user_id" });
-
   const user = getOrCreateSignalUser(userId);
   const expired = isExpired(user);
   const activeTier = expired && user.tier > 0 ? 0 : user.tier;
   const config = SIGNAL_TIERS[activeTier];
-
   return res.json({
-    ok: true,
-    user_id: userId,
-    product: "signals",
-    tier: activeTier,
-    tier_name: config.name,
-    is_paid: activeTier >= 1,
-    is_expired: expired && user.tier > 0,
-    expires_at: user.expires_at,
-    total_paid_usdc: user.total_paid_usdc,
+    ok: true, user_id: userId, product: "signals",
+    tier: activeTier, tier_name: config.name,
+    is_paid: activeTier >= 1, is_expired: expired && user.tier > 0,
+    expires_at: user.expires_at, total_paid_usdc: user.total_paid_usdc,
     signals_today: user.last_signal_date === today() ? user.signals_today : 0,
     daily_limit: config.daily_limit,
   });
@@ -250,31 +184,20 @@ app.get("/subscribe", (req, res) => {
   const tier = parseInt(req.query.tier) || 1;
   if (!userId) return res.json({ ok: false, reason: "missing_user_id" });
   if (!SIGNAL_TIERS[tier] || tier === 0) return res.json({ ok: false, reason: "invalid_tier" });
-
   const config = SIGNAL_TIERS[tier];
   const link = `${CHECKOUT_URL}?tgid=${userId}&product=signals&tier=${tier}&price=${config.price}`;
-  return res.json({
-    ok: true,
-    product: "signals",
-    checkout_url: link,
-    tier,
-    tier_name: config.name,
-    price_usdc: config.price,
-  });
+  return res.json({ ok: true, product: "signals", checkout_url: link, tier, tier_name: config.name, price_usdc: config.price });
 });
 
 app.get("/plans", (req, res) => {
   const plans = Object.entries(SIGNAL_TIERS).map(([id, c]) => ({
-    tier: parseInt(id),
-    name: c.name,
-    price_usdc: c.price,
-    daily_limit: c.daily_limit || "unlimited",
+    tier: parseInt(id), name: c.name, price_usdc: c.price, daily_limit: c.daily_limit || "unlimited",
   }));
   return res.json({ ok: true, product: "signals", plans });
 });
 
 // ═════════════════════════════════════════════════════════════
-// SPORTS ENDPOINTS (NEW)
+// SPORTS ENDPOINTS
 // ═════════════════════════════════════════════════════════════
 
 app.get("/sports/can-send", (req, res) => {
@@ -286,132 +209,59 @@ app.get("/sports/can-send", (req, res) => {
   const config = SPORTS_TIERS[tier];
 
   if (tier >= 1) {
-    return res.json({
-      allowed: true,
-      tier: tier,
-      tier_name: config.name,
-    });
+    return res.json({ allowed: true, tier, tier_name: config.name });
   }
 
-  // Free tier: 1 code per week limit
-  const wkStart = weekStart();
-  let codesThisWeek = user.codes_this_week || 0;
-  if (user.week_start_date !== wkStart) {
-    codesThisWeek = 0;
-    db.prepare("UPDATE sports_subscriptions SET codes_this_week = 0, week_start_date = ? WHERE telegram_id = ?")
-      .run(wkStart, userId);
+  // Free tier: 1 code per DAY
+  const todayDate = today();
+  let codesToday = user.codes_today || 0;
+  if (user.last_code_date !== todayDate) {
+    codesToday = 0;
+    db.prepare("UPDATE sports_subscriptions SET codes_today = 0, last_code_date = ? WHERE telegram_id = ?")
+      .run(todayDate, userId);
   }
 
-  if (codesThisWeek >= config.weekly_limit) {
+  if (codesToday >= config.daily_limit) {
     return res.json({
-      allowed: false,
-      tier: 0,
-      tier_name: "Free",
-      reason: "weekly_limit_reached",
-      remaining: 0,
+      allowed: false, tier: 0, tier_name: "Free",
+      reason: "daily_limit_reached", remaining: 0,
       upgrade_url: `${CHECKOUT_URL}?tgid=${userId}&product=sports`,
     });
   }
-
-  return res.json({
-    allowed: true,
-    tier: 0,
-    tier_name: "Free",
-    free_remaining: config.weekly_limit - codesThisWeek,
-  });
+  return res.json({ allowed: true, tier: 0, tier_name: "Free", free_remaining: config.daily_limit - codesToday });
 });
 
 app.post("/sports/code-sent", (req, res) => {
   const userId = req.body.user_id;
   if (!userId) return res.json({ ok: false, reason: "missing_user_id" });
-
   const user = getOrCreateSportsUser(userId);
-  // Only track for free users (paid have no limit)
   if (user.tier > 0 && !isExpired(user)) {
     return res.json({ ok: true, paid: true });
   }
-
-  const wkStart = weekStart();
-  let codes = user.codes_this_week || 0;
-  if (user.week_start_date !== wkStart) codes = 0;
-
-  db.prepare(
-    "UPDATE sports_subscriptions SET codes_this_week = ?, week_start_date = ?, updated_at = datetime('now') WHERE telegram_id = ?"
-  ).run(codes + 1, wkStart, userId);
-
-  return res.json({ ok: true, codes_this_week: codes + 1 });
-});
-
-app.post("/sports/activate", (req, res) => {
-  const { user_id, tier, wallet_address, tx_hash, amount_usdc } = req.body;
-
-  if (!user_id || tier === undefined) {
-    return res.json({ ok: false, reason: "missing_fields" });
-  }
-  if (!SPORTS_TIERS[tier] || tier === 0) {
-    return res.json({ ok: false, reason: "invalid_tier" });
-  }
-
-  const config = SPORTS_TIERS[tier];
-  const expiresAt = new Date();
-  expiresAt.setDate(expiresAt.getDate() + 30);
-
-  getOrCreateSportsUser(user_id);
-
-  db.prepare(`
-    UPDATE sports_subscriptions SET
-      tier = ?,
-      tier_name = ?,
-      wallet_address = ?,
-      expires_at = ?,
-      total_paid_usdc = total_paid_usdc + ?,
-      updated_at = datetime('now')
-    WHERE telegram_id = ?
-  `).run(tier, config.name, wallet_address || "", expiresAt.toISOString(), amount_usdc || 0, user_id);
-
-  db.prepare(`
-    INSERT INTO payments (telegram_id, product, tier, amount_usdc, wallet_address, tx_hash)
-    VALUES (?, 'sports', ?, ?, ?, ?)
-  `).run(user_id, tier, amount_usdc || 0, wallet_address || "", tx_hash || "");
-
-  return res.json({
-    ok: true,
-    product: "sports",
-    tier: tier,
-    tier_name: config.name,
-    expires_at: expiresAt.toISOString(),
-    message: `${config.name} sports plan activated until ${expiresAt.toLocaleDateString()}`,
-  });
+  const todayDate = today();
+  let c = user.codes_today || 0;
+  if (user.last_code_date !== todayDate) c = 0;
+  db.prepare("UPDATE sports_subscriptions SET codes_today = ?, last_code_date = ?, updated_at = datetime('now') WHERE telegram_id = ?")
+    .run(c + 1, todayDate, userId);
+  return res.json({ ok: true, codes_today: c + 1 });
 });
 
 app.get("/sports/status", (req, res) => {
   const userId = req.query.user_id;
   if (!userId) return res.json({ ok: false, reason: "missing_user_id" });
-
   const user = getOrCreateSportsUser(userId);
   const expired = isExpired(user);
   const activeTier = expired && user.tier > 0 ? 0 : user.tier;
   const config = SPORTS_TIERS[activeTier];
-
-  const wkStart = weekStart();
-  const codesThisWeek = user.week_start_date === wkStart ? (user.codes_this_week || 0) : 0;
-  const freeRemaining = activeTier === 0
-    ? Math.max(0, config.weekly_limit - codesThisWeek)
-    : null;
-
+  const todayDate = today();
+  const codesToday = user.last_code_date === todayDate ? (user.codes_today || 0) : 0;
+  const freeRemaining = activeTier === 0 ? Math.max(0, config.daily_limit - codesToday) : null;
   return res.json({
-    ok: true,
-    user_id: userId,
-    product: "sports",
-    tier: activeTier,
-    tier_name: config.name,
-    is_paid: activeTier >= 1,
-    is_expired: expired && user.tier > 0,
-    expires_at: user.expires_at,
-    total_paid_usdc: user.total_paid_usdc,
-    codes_this_week: codesThisWeek,
-    weekly_limit: config.weekly_limit,
-    free_remaining: freeRemaining,
+    ok: true, user_id: userId, product: "sports",
+    tier: activeTier, tier_name: config.name,
+    is_paid: activeTier >= 1, is_expired: expired && user.tier > 0,
+    expires_at: user.expires_at, total_paid_usdc: user.total_paid_usdc,
+    codes_today: codesToday, daily_limit: config.daily_limit, free_remaining: freeRemaining,
   });
 });
 
@@ -420,141 +270,67 @@ app.get("/sports/subscribe", (req, res) => {
   const tier = parseInt(req.query.tier) || 1;
   if (!userId) return res.json({ ok: false, reason: "missing_user_id" });
   if (!SPORTS_TIERS[tier] || tier === 0) return res.json({ ok: false, reason: "invalid_tier" });
-
   const config = SPORTS_TIERS[tier];
   const link = `${CHECKOUT_URL}?tgid=${userId}&product=sports&tier=${tier}&price=${config.price}`;
-  return res.json({
-    ok: true,
-    product: "sports",
-    checkout_url: link,
-    tier,
-    tier_name: config.name,
-    price_usdc: config.price,
-  });
+  return res.json({ ok: true, product: "sports", checkout_url: link, tier, tier_name: config.name, price_usdc: config.price });
 });
 
 app.get("/sports/plans", (req, res) => {
   const plans = Object.entries(SPORTS_TIERS).map(([id, c]) => ({
-    tier: parseInt(id),
-    name: c.name,
-    price_usdc: c.price,
-    weekly_limit: c.weekly_limit || "unlimited",
+    tier: parseInt(id), name: c.name, price_usdc: c.price, daily_limit: c.daily_limit || "unlimited",
   }));
   return res.json({ ok: true, product: "sports", plans });
 });
 
 // ═════════════════════════════════════════════════════════════
-// UNIFIED /activate (routes to right product)
+// UNIFIED /activate
 // ═════════════════════════════════════════════════════════════
-//
-// The checkout page calls this. If `product` is "sports", routes to sports table.
-// Defaults to "signals" if product not specified (backwards compatible).
 
 app.post("/activate", (req, res) => {
   const { user_id, product, tier, wallet_address, tx_hash, amount_usdc } = req.body;
-  if (!user_id || tier === undefined) {
-    return res.json({ ok: false, reason: "missing_fields" });
-  }
+  if (!user_id || tier === undefined) return res.json({ ok: false, reason: "missing_fields" });
 
   const productKey = (product || "signals").toLowerCase();
 
-  // Route to sports if specified
   if (productKey === "sports") {
-    if (!SPORTS_TIERS[tier] || tier === 0) {
-      return res.json({ ok: false, reason: "invalid_tier" });
-    }
+    if (!SPORTS_TIERS[tier] || tier === 0) return res.json({ ok: false, reason: "invalid_tier" });
     const config = SPORTS_TIERS[tier];
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 30);
-
     getOrCreateSportsUser(user_id);
-    db.prepare(`
-      UPDATE sports_subscriptions SET
-        tier = ?, tier_name = ?, wallet_address = ?, expires_at = ?,
-        total_paid_usdc = total_paid_usdc + ?, updated_at = datetime('now')
-      WHERE telegram_id = ?
-    `).run(tier, config.name, wallet_address || "", expiresAt.toISOString(), amount_usdc || 0, user_id);
-
-    db.prepare(`
-      INSERT INTO payments (telegram_id, product, tier, amount_usdc, wallet_address, tx_hash)
-      VALUES (?, 'sports', ?, ?, ?, ?)
-    `).run(user_id, tier, amount_usdc || 0, wallet_address || "", tx_hash || "");
-
-    return res.json({
-      ok: true,
-      product: "sports",
-      tier,
-      tier_name: config.name,
-      expires_at: expiresAt.toISOString(),
-      message: `${config.name} sports plan activated`,
-    });
+    db.prepare(`UPDATE sports_subscriptions SET tier=?, tier_name=?, wallet_address=?, expires_at=?, total_paid_usdc = total_paid_usdc + ?, updated_at = datetime('now') WHERE telegram_id = ?`)
+      .run(tier, config.name, wallet_address || "", expiresAt.toISOString(), amount_usdc || 0, user_id);
+    db.prepare(`INSERT INTO payments (telegram_id, product, tier, amount_usdc, wallet_address, tx_hash) VALUES (?, 'sports', ?, ?, ?, ?)`)
+      .run(user_id, tier, amount_usdc || 0, wallet_address || "", tx_hash || "");
+    return res.json({ ok: true, product: "sports", tier, tier_name: config.name, expires_at: expiresAt.toISOString() });
   }
 
-  // Default: signals
+  // Signals (default)
   if (!SIGNAL_TIERS[tier]) return res.json({ ok: false, reason: "invalid_tier" });
-
   const config = SIGNAL_TIERS[tier];
   const expiresAt = new Date();
   expiresAt.setDate(expiresAt.getDate() + 30);
-
   getOrCreateSignalUser(user_id);
-  db.prepare(`
-    UPDATE users SET
-      tier = ?, tier_name = ?, wallet_address = ?, expires_at = ?,
-      total_paid_usdc = total_paid_usdc + ?, updated_at = datetime('now')
-    WHERE telegram_id = ?
-  `).run(tier, config.name, wallet_address || "", expiresAt.toISOString(), amount_usdc || 0, user_id);
-
-  db.prepare(`
-    INSERT INTO payments (telegram_id, product, tier, amount_usdc, wallet_address, tx_hash)
-    VALUES (?, 'signals', ?, ?, ?, ?)
-  `).run(user_id, tier, amount_usdc || 0, wallet_address || "", tx_hash || "");
-
-  return res.json({
-    ok: true,
-    product: "signals",
-    tier,
-    tier_name: config.name,
-    expires_at: expiresAt.toISOString(),
-    message: `${config.name} signals plan activated`,
-  });
+  db.prepare(`UPDATE users SET tier=?, tier_name=?, wallet_address=?, expires_at=?, total_paid_usdc = total_paid_usdc + ?, updated_at = datetime('now') WHERE telegram_id = ?`)
+    .run(tier, config.name, wallet_address || "", expiresAt.toISOString(), amount_usdc || 0, user_id);
+  db.prepare(`INSERT INTO payments (telegram_id, product, tier, amount_usdc, wallet_address, tx_hash) VALUES (?, 'signals', ?, ?, ?, ?)`)
+    .run(user_id, tier, amount_usdc || 0, wallet_address || "", tx_hash || "");
+  return res.json({ ok: true, product: "signals", tier, tier_name: config.name, expires_at: expiresAt.toISOString() });
 });
 
 // ─── Health ───────────────────────────────────────────────────
 
 app.get("/", (req, res) => {
   res.json({
-    service: "Cmvng SignalVault Payment API v2",
+    service: "Cmvng SignalVault Payment API v2.1",
     status: "running",
     products: ["signals", "sports"],
-    signals_endpoints: [
-      "GET  /can-send?user_id=X",
-      "POST /signal-sent {user_id}",
-      "GET  /status?user_id=X",
-      "GET  /subscribe?user_id=X&tier=N",
-      "GET  /plans",
-    ],
-    sports_endpoints: [
-      "GET  /sports/can-send?user_id=X",
-      "POST /sports/code-sent {user_id}",
-      "POST /sports/activate {user_id, tier, ...}",
-      "GET  /sports/status?user_id=X",
-      "GET  /sports/subscribe?user_id=X&tier=N",
-      "GET  /sports/plans",
-    ],
-    unified: [
-      "POST /activate {user_id, product, tier, ...} → routes to right product",
-    ],
+    sports_tiers: Object.fromEntries(Object.entries(SPORTS_TIERS).map(([k,v]) => [k, { name: v.name, price: v.price }])),
+    note: "Sports free tier: 1 code per day, rotating tier by weekday",
   });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log("");
-  console.log("╔════════════════════════════════════════════════╗");
-  console.log("║  Cmvng SignalVault — Payment API v2             ║");
-  console.log(`║  Running on port ${PORT}                           ║`);
-  console.log("║  Products: signals + sports                     ║");
-  console.log("╚════════════════════════════════════════════════╝");
-  console.log("");
+  console.log("Cmvng SignalVault Payment API v2.1 — port " + PORT);
 });
